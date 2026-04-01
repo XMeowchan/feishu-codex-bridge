@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 if (-not (Get-Command psmux -ErrorAction SilentlyContinue)) {
-    Write-Host "未找到 psmux，请先安装："
+    Write-Host "psmux not found，please install first："
     Write-Host "  winget install psmux"
     exit 1
 }

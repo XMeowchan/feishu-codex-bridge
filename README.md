@@ -95,6 +95,28 @@ python3 Tools/feishu_codex_bridge/bridge.py --config Tools/feishu_codex_bridge/b
 python3 Tools/feishu_codex_bridge/bridge.py --config Tools/feishu_codex_bridge/bridge.toml
 ```
 
+启动后通常会先看到：
+
+```text
+Starting Feishu event subscription
+```
+
+然后在订阅进程稳定约 2 秒后，你会看到这条 ready 日志：
+
+```text
+Feishu event subscription ready (connection stable, you can now send messages from Feishu)
+```
+
+看到这条后，就表示当前已经过了启动窗口期，可以去飞书发送第一条消息了。
+
+如果后面又看到：
+
+```text
+Feishu event subscription is receiving events (first event observed)
+```
+
+说明这条订阅连接已经实际收到了至少一条飞书事件。
+
 如果你希望直接双击启动：
 
 - macOS：双击 [start_bridge.command](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/start_bridge.command)
@@ -111,6 +133,14 @@ tmux attach -t feishu-codex-bridge
 如果你改了 `tmux_session_name`，把上面的名字换掉即可。
 
 在 `tmux` 里按 `Ctrl+b` 然后按 `d` 可以 detach，不会停止桥接服务。
+
+如果你只是想关闭当前 `tmux` 会话，但保留桥接服务继续运行：
+
+```bash
+tmux kill-session -t feishu-codex-bridge
+```
+
+下次再收到普通飞书消息时，桥接服务会自动重建一个新的 `tmux` 会话。
 
 ## 工作方式
 
@@ -129,6 +159,7 @@ lark-cli im +messages-reply --message-id <incoming_message_id> --text "<ack_text
 - 对当前消息优先调用 `lark-cli im +messages-reply --message-id <id> --text ... --as bot`
 - 不要等所有回答完成才一起发，收到消息后先发一条简短进度，再在处理中持续追加回复
 - 如果 `Codex` 在 10 秒内还没有主动通过飞书回用户，桥接层会自动补一条“仍在处理中”的 watchdog 提示；之后每 30 秒补一条心跳，直到 `Codex` 真正开始通过飞书回复或任务结束
+- 当前版本只处理订阅通道实时收到的消息；如果服务启动前或订阅建立窗口期有消息漏掉，桥接层不会补捞历史消息
 
 桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。
 
@@ -145,18 +176,47 @@ v1 固定行为：
 
 ## 控制命令
 
-私聊机器人时，除了普通消息，还支持两个桥接层原生命令：
+私聊机器人时，除了普通消息，还支持下面这些桥接层原生命令：
 
 - `/status`：立即返回桥接状态，包括当前 `tmux` 会话是否在线、是否正在处理、排队消息数、工作目录以及 attach 命令
 - `/reset`：按当前消息顺序重置会话。执行到这条命令时，会销毁旧的 `Codex` 会话并立刻创建一个新的 `tmux` 会话，然后回复你新的会话已就绪
 - `/interrupt`：立即向当前 `tmux` 中的 `Codex` 会话发送中断信号，尝试停止当前这一轮处理，但不重建整个会话
+
+推荐把它们理解成“桥接层保留命令”，而不是交给 `Codex` 解释的普通对话。
+
+精确匹配规则：
+
+- 只有消息内容在去掉首尾空白后，**完全等于** `/status`、`/reset`、`/interrupt` 之一时，才会触发桥接层命令
+- 例如 `/status 现在怎么样`、`/reset please`、`/interrupt 帮我停一下` 都不会命中保留命令
+- 其他以 `/` 开头但不精确匹配这三个命令的内容，会被当成普通用户消息，照常转发给 `Codex`
+
+飞书端示例：
+
+```text
+/status
+/reset
+/interrupt
+```
 
 说明：
 
 - `/reset` 不会粗暴打断前面已经在处理中的消息；它会进入同一个顺序队列，保证上下文切换时机可预期
 - `/interrupt` 走立即执行路径，不排队；如果当前没有正在执行的任务，会直接回你“当前没有正在执行的任务”
 - 如果 `/interrupt` 后当前这一轮仍未停止，可以再发送 `/reset`
-- `/status` 现在会额外显示三段桥接状态：`订阅进程`、`事件通道`、`轮询兜底`。其中 `事件通道：连接中，尚未观测到首个事件（可能仍在启动窗口期）` 就表示你现在还处在启动窗口期附近
+- `/status` 现在会额外显示两段桥接状态：`订阅进程`、`事件通道`
+- `事件通道：连接中，正在建立事件通道` 表示还没 ready，建议再等一下
+- `事件通道：已就绪，当前可以在飞书发送消息` 表示现在可以发送第一条飞书消息
+- `事件通道：已收到事件（最近 X 秒前）` 表示订阅已经实际收到过消息事件
+
+## 推荐使用流程
+
+第一次启动或重启桥接后，推荐按这个顺序操作：
+
+1. 启动桥接服务
+2. 等待本地终端出现 `Feishu event subscription ready (connection stable, you can now send messages from Feishu)`
+3. 再去飞书发送第一条普通消息，或者先发 `/status`
+4. 如果想看真实界面，执行 `tmux attach -t <tmux_session_name>`
+5. 如果当前任务卡住，先发 `/interrupt`；还不行再发 `/reset`
 
 ## launchd
 

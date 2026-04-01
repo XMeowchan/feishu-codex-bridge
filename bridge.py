@@ -15,7 +15,6 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +47,7 @@ CODEx_FAILURE_TEXT = "本地 Codex 会话启动失败，请稍后重试。"
 WATCHDOG_PROCESSING_TEXT = "仍在处理中，我会继续同步进展，完成后会继续回复你。"
 WATCHDOG_HEARTBEAT_TEXT = "还在处理中，当前还没有结束；我会继续同步新的进展。"
 SUBSCRIBE_RESTART_DELAY_SECONDS = 5.0
+SUBSCRIPTION_READY_STABILIZE_SECONDS = 2.0
 QUIET_WINDOW_SECONDS = 4.0
 FIRST_OUTPUT_TIMEOUT_SECONDS = 20.0
 SESSION_STARTUP_TIMEOUT_SECONDS = 25.0
@@ -66,8 +66,6 @@ DEFAULT_TMUX_SESSION_NAME = "feishu-codex-bridge"
 LOG_DEDUP_WINDOW_SECONDS = 15.0
 RUNTIME_DIR_NAME = ".runtime"
 LARK_CLI_WRAPPER_RELATIVE_PATH = Path("bin") / "lark-cli"
-POLL_INTERVAL_SECONDS = 5.0
-POLL_PAGE_SIZE = 10
 SEEN_MESSAGE_IDS_FILENAME = "seen_message_ids.txt"
 
 
@@ -1001,12 +999,10 @@ class BridgeService:
         self._stop_event = threading.Event()
         self._subscription_lock = threading.Lock()
         self._subscription_proc: subprocess.Popen[str] | None = None
-        self._poll_thread = threading.Thread(target=self._poll_recent_messages_loop, name="feishu-poll-backup", daemon=True)
-        self._known_chat_id = ""
         self._state_lock = threading.Lock()
         self._subscription_started_at = 0.0
+        self._subscription_ready_at = 0.0
         self._subscription_last_event_at = 0.0
-        self._poll_last_success_at = 0.0
 
     def close(self) -> None:
         self._stop_event.set()
@@ -1018,10 +1014,6 @@ class BridgeService:
         self._session.close()
 
     def run(self) -> None:
-        if not self._poll_thread.is_alive():
-            self._logger.info("Starting Feishu polling backup")
-            self._poll_thread.start()
-
         while not self._stop_event.is_set():
             self._run_subscribe_once()
             if not self._stop_event.is_set():
@@ -1046,6 +1038,7 @@ class BridgeService:
         self._logger.info("Starting Feishu event subscription")
         with self._state_lock:
             self._subscription_started_at = time.monotonic()
+            self._subscription_ready_at = 0.0
             self._subscription_last_event_at = 0.0
         proc = subprocess.Popen(
             command,
@@ -1061,6 +1054,8 @@ class BridgeService:
 
         stderr_thread = threading.Thread(target=self._log_stderr, args=(proc,), daemon=True)
         stderr_thread.start()
+        ready_thread = threading.Thread(target=self._await_subscription_ready, args=(proc,), daemon=True)
+        ready_thread.start()
 
         assert proc.stdout is not None
         try:
@@ -1084,6 +1079,22 @@ class BridgeService:
                     proc.kill()
 
             stderr_thread.join(timeout=1.0)
+            ready_thread.join(timeout=1.0)
+
+    def _await_subscription_ready(self, proc: subprocess.Popen[str]) -> None:
+        deadline = time.monotonic() + SUBSCRIPTION_READY_STABILIZE_SECONDS
+        while time.monotonic() < deadline:
+            if self._stop_event.is_set() or proc.poll() is not None:
+                return
+            time.sleep(0.1)
+
+        if self._stop_event.is_set() or proc.poll() is not None:
+            return
+
+        if self._mark_subscription_ready():
+            self._logger.info(
+                "Feishu event subscription ready (connection stable, you can now send messages from Feishu)"
+            )
 
     def _log_stderr(self, proc: subprocess.Popen[str]) -> None:
         if not proc.stderr:
@@ -1093,25 +1104,24 @@ class BridgeService:
             if should_log_lark_event_stderr(text):
                 self._logger.info("[lark-event] %s", text)
 
-    def _mark_subscription_event_observed(self) -> None:
-        should_log_ready = False
+    def _mark_subscription_ready(self) -> bool:
         with self._state_lock:
+            if self._subscription_ready_at > 0:
+                return False
+            self._subscription_ready_at = time.monotonic()
+            return True
+
+    def _mark_subscription_event_observed(self) -> None:
+        should_log_first_event = False
+        with self._state_lock:
+            if self._subscription_ready_at <= 0:
+                self._subscription_ready_at = time.monotonic()
             if self._subscription_last_event_at <= 0:
-                should_log_ready = True
+                should_log_first_event = True
             self._subscription_last_event_at = time.monotonic()
 
-        if should_log_ready:
-            self._logger.info("Feishu event subscription ready (first event observed)")
-
-    def _mark_poll_success(self) -> None:
-        should_log_ready = False
-        with self._state_lock:
-            if self._poll_last_success_at <= 0:
-                should_log_ready = True
-            self._poll_last_success_at = time.monotonic()
-
-        if should_log_ready:
-            self._logger.info("Feishu polling backup ready")
+        if should_log_first_event:
+            self._logger.info("Feishu event subscription is receiving events (first event observed)")
 
     def _subscription_process_alive(self) -> bool:
         with self._subscription_lock:
@@ -1134,8 +1144,8 @@ class BridgeService:
 
         with self._state_lock:
             subscription_started_at = self._subscription_started_at
+            subscription_ready_at = self._subscription_ready_at
             subscription_last_event_at = self._subscription_last_event_at
-            poll_last_success_at = self._poll_last_success_at
 
         if self._subscription_process_alive():
             subscription_process_text = "已启动"
@@ -1144,21 +1154,17 @@ class BridgeService:
 
         if subscription_last_event_at > 0:
             event_channel_text = f"已收到事件（最近 {self._format_age_seconds(subscription_last_event_at)}）"
+        elif subscription_ready_at > 0 and self._subscription_process_alive():
+            event_channel_text = "已就绪，当前可以在飞书发送消息"
         elif subscription_started_at > 0 and self._subscription_process_alive():
-            event_channel_text = "连接中，尚未观测到首个事件（可能仍在启动窗口期）"
+            event_channel_text = "连接中，正在建立事件通道"
         else:
             event_channel_text = "未连接"
-
-        if poll_last_success_at > 0:
-            poll_text = f"已就绪（最近成功 {self._format_age_seconds(poll_last_success_at)}）"
-        else:
-            poll_text = "尚未完成首次拉取"
 
         lines = [
             header_line,
             f"订阅进程：{subscription_process_text}",
             f"事件通道：{event_channel_text}",
-            f"轮询兜底：{poll_text}",
         ]
         lines.extend(session_lines)
         return "\n".join(lines)
@@ -1176,7 +1182,7 @@ class BridgeService:
         message = self._parse_incoming_message(payload)
         if not message:
             return
-        self._process_incoming_message(message, source="event")
+        self._process_incoming_message(message)
 
     def _parse_incoming_message(self, payload: dict[str, Any]) -> IncomingMessage | None:
         chat_type = str(payload.get("chat_type") or "")
@@ -1206,17 +1212,10 @@ class BridgeService:
             content=content,
         )
 
-    def _process_incoming_message(self, message: IncomingMessage, *, source: str) -> None:
-        if message.chat_id:
-            self._known_chat_id = message.chat_id
-
+    def _process_incoming_message(self, message: IncomingMessage) -> None:
         if message.message_id and self._deduper.seen(message.message_id):
-            if source != "poll":
-                self._logger.info("Skipping duplicated message %s", message.message_id)
+            self._logger.info("Skipping duplicated message %s", message.message_id)
             return
-
-        if source == "poll":
-            self._logger.info("Recovered message %s via polling backup", message.message_id)
 
         if message.message_type not in {"text", "post"} or not message.content.strip():
             self._messenger.reply_text(message.message_id, UNSUPPORTED_MESSAGE_TEXT)
@@ -1246,100 +1245,6 @@ class BridgeService:
 
         self._messenger.reply_text(message.message_id, self._config.ack_text)
         self._session.submit(message)
-
-    def _poll_recent_messages_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self._poll_recent_messages_once()
-            except Exception:
-                self._logger.exception("Failed to poll recent Feishu messages")
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-    def _poll_recent_messages_once(self) -> None:
-        command = [
-            "lark-cli",
-            "im",
-            "+chat-messages-list",
-            "--user-id",
-            self._config.allowed_sender_open_id,
-            "--as",
-            "bot",
-            "--page-size",
-            str(POLL_PAGE_SIZE),
-            "--format",
-            "json",
-        ]
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip()
-            stdout = completed.stdout.strip()
-            self._logger.warning(
-                "Recent-message polling failed (code=%s). stdout=%s stderr=%s",
-                completed.returncode,
-                stdout,
-                stderr,
-            )
-            return
-
-        try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            self._logger.warning("Ignoring malformed polling payload: %s", completed.stdout.strip())
-            return
-
-        if not payload.get("ok"):
-            self._logger.warning("Polling payload reported failure: %s", payload)
-            return
-
-        self._mark_poll_success()
-
-        messages = payload.get("data", {}).get("messages", [])
-        if not isinstance(messages, list):
-            return
-
-        for item in reversed(messages):
-            message = self._parse_polled_message(item)
-            if message:
-                self._process_incoming_message(message, source="poll")
-
-    def _parse_polled_message(self, item: dict[str, Any]) -> IncomingMessage | None:
-        if not isinstance(item, dict):
-            return None
-
-        sender = item.get("sender") or {}
-        sender_id = str(sender.get("id") or "")
-        sender_type = str(sender.get("sender_type") or "")
-        message_id = str(item.get("message_id") or "")
-        message_type = str(item.get("msg_type") or "")
-        content = str(item.get("content") or "")
-        deleted = bool(item.get("deleted"))
-
-        if deleted or sender_type != "user" or sender_id != self._config.allowed_sender_open_id:
-            return None
-
-        create_time = str(item.get("create_time") or "")
-        if create_time:
-            try:
-                created_at = datetime.strptime(create_time, "%Y-%m-%d %H:%M")
-                age_seconds = abs((datetime.now() - created_at).total_seconds())
-                if age_seconds > 60.0 * 60.0 * 12.0:
-                    return None
-            except ValueError:
-                pass
-
-        return IncomingMessage(
-            message_id=message_id,
-            chat_id=self._known_chat_id,
-            sender_id=sender_id,
-            message_type=message_type,
-            content=content,
-        )
 
 
 def load_config(path: Path) -> BridgeConfig:

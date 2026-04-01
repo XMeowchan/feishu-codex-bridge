@@ -127,6 +127,22 @@ def resolve_power_shell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell")
 
 
+def resolve_lark_cli_node_command(resolved_path: Path) -> list[str] | None:
+    if not is_windows() or resolved_path.suffix.lower() != ".cmd":
+        return None
+
+    run_js = resolved_path.parent / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
+    if not run_js.exists():
+        return None
+
+    node_executable = resolved_path.parent / "node.exe"
+    node_command = str(node_executable) if node_executable.exists() else shutil.which("node")
+    if not node_command:
+        return None
+
+    return [node_command, str(run_js)]
+
+
 def quote_power_shell_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -137,6 +153,11 @@ def resolve_executable_command(executable_name: str) -> list[str]:
         return [executable_name]
 
     resolved_path = Path(resolved)
+    if executable_name == "lark-cli":
+        node_command = resolve_lark_cli_node_command(resolved_path)
+        if node_command:
+            return node_command
+
     if is_windows() and resolved_path.suffix.lower() == ".ps1":
         power_shell = resolve_power_shell_executable()
         if not power_shell:
@@ -423,12 +444,23 @@ class MessageDeduper:
 class LarkMessenger:
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger
+        self._wrapper_module_path = Path(__file__).parent / LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH
+        self._real_lark_cli_command = resolve_executable_command("lark-cli")
+
+    def _build_command(self, *args: str) -> tuple[list[str], dict[str, str] | None]:
+        if not self._wrapper_module_path.exists():
+            return build_lark_cli_command(*args), None
+
+        env = os.environ.copy()
+        env["FEISHU_BRIDGE_REAL_LARK_CLI_JSON"] = json.dumps(self._real_lark_cli_command)
+        env.pop("FEISHU_BRIDGE_LARK_EVENT_LOG", None)
+        return [sys.executable, str(self._wrapper_module_path), *args], env
 
     def reply_text(self, message_id: str, text: str) -> bool:
         if not text.strip():
             return True
 
-        command = build_lark_cli_command(
+        command, env = self._build_command(
             "im",
             "+messages-reply",
             "--message-id",
@@ -445,6 +477,7 @@ class LarkMessenger:
             capture_output=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         if completed.returncode == 0:
             return True
@@ -801,6 +834,13 @@ class CodexSession:
         scroll_lines = str(TMUX_WHEEL_SCROLL_LINES)
 
         run_mux(["set-option", "-t", session_target, "mouse", "on"], check=False)
+
+        if is_windows():
+            # psmux exposes these as session options and does not fully emulate tmux's wheel bindings.
+            run_mux(["set-option", "-t", session_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
+            run_mux(["set-option", "-t", session_target, "mode-keys", "vi"], check=False)
+            return
+
         run_mux(["set-window-option", "-t", window_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
         run_mux(["set-window-option", "-t", window_target, "mode-keys", "vi"], check=False)
 
@@ -920,6 +960,19 @@ class CodexSession:
             return None
         return completed.stdout
 
+    def _pane_in_mode(self) -> bool:
+        completed = run_mux(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                self._mux_target,
+                "#{pane_in_mode}",
+            ],
+            check=False,
+        )
+        return completed.returncode == 0 and completed.stdout.strip() == "1"
+
     def _session_looks_like_codex(self) -> bool:
         snapshot = self._capture_snapshot()
         if snapshot is None:
@@ -1002,6 +1055,11 @@ class CodexSession:
 
         if not self._ui_ready.is_set():
             self._ui_ready.wait(timeout=SESSION_STARTUP_TIMEOUT_SECONDS)
+
+        if self._pane_in_mode():
+            self._logger.warning("Codex pane is in copy-mode; exiting before submitting %s", prompt_name)
+            self._send_keys("q")
+            time.sleep(0.15)
 
         self._logger.info("Submitting prompt to Codex (%s)", prompt_name)
         self._paste_text(prompt)

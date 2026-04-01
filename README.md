@@ -246,3 +246,7 @@ launchctl load ~/Library/LaunchAgents/com.example.feishu-codex-bridge.plist
 - 日志里看到 `Do you trust the contents of this directory?`：首次运行时脚本会自动确认
 - 日志里看到 `Continue anyway? [y/N]`：脚本会自动接受兼容提示，并为子进程设置 `TERM=xterm-256color`
 - 想看真正的交互界面：执行 `tmux attach -t <tmux_session_name>`
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

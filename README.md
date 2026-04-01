@@ -27,6 +27,7 @@
 - `start_bridge.py`: 跨平台公共启动器
 - `start_bridge.command`: macOS 双击启动脚本
 - `start_bridge.cmd`: Windows 双击启动脚本
+- `start_bridge_powershell.cmd`: Windows PowerShell 双击启动脚本
 - `feishu-codex-bridge.plist.example`: macOS `launchd` 示例
 
 ## 前置条件
@@ -130,6 +131,7 @@ Feishu event subscription is receiving events (first event observed)
 
 - macOS：双击 [start_bridge.command](start_bridge.command)
 - Windows：双击 [start_bridge.cmd](start_bridge.cmd)
+- Windows PowerShell：双击 [start_bridge_powershell.cmd](start_bridge_powershell.cmd)
 
 这两个文件都会用相对位置自动找到同目录下的 [bridge.py](bridge.py) 和 `bridge.toml`。
 

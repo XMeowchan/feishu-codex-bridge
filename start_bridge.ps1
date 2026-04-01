@@ -2,6 +2,12 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+if (-not (Get-Command psmux -ErrorAction SilentlyContinue)) {
+    Write-Host "未找到 psmux，请先安装："
+    Write-Host "  winget install psmux"
+    exit 1
+}
+
 $pythonCommand = $null
 if (Get-Command py -ErrorAction SilentlyContinue) {
     $pythonCommand = @("py", "-3")

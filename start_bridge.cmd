@@ -5,7 +5,7 @@ set "SCRIPT_DIR=%~dp0"
 
 where psmux >nul 2>nul
 if not %ERRORLEVEL% EQU 0 (
-    echo psmux not found，please install first：
+    echo psmux not found, please install first:
     echo   winget install psmux
     set "RC=1"
     goto after_run

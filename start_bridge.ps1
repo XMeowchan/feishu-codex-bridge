@@ -1,8 +1,48 @@
+param(
+    [switch]$StayOpen
+)
+
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exitCode = 1
 $previousPythonUtf8 = $null
+
+function Start-InPersistentWindowIfNeeded {
+    if ($StayOpen) {
+        return
+    }
+
+    $parentName = $null
+    try {
+        $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId = $PID").ParentProcessId
+        if ($parentId) {
+            $parentName = (Get-Process -Id $parentId -ErrorAction Stop).ProcessName
+        }
+    } catch {
+        return
+    }
+
+    if ($parentName -ne "explorer") {
+        return
+    }
+
+    $powerShellExe = $null
+    if (Get-Command pwsh -ErrorAction SilentlyContinue) {
+        $powerShellExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    } elseif (Get-Command powershell -ErrorAction SilentlyContinue) {
+        $powerShellExe = (Get-Command powershell -ErrorAction SilentlyContinue).Source
+    }
+
+    if (-not $powerShellExe) {
+        return
+    }
+
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $arguments = "-NoExit -ExecutionPolicy Bypass -File `"$scriptPath`" -StayOpen"
+    Start-Process -FilePath $powerShellExe -WorkingDirectory $scriptDir -ArgumentList $arguments
+    exit 0
+}
 
 function Wait-BeforeExit {
     param(
@@ -20,6 +60,8 @@ function Wait-BeforeExit {
     Read-Host "Press Enter to close this window" | Out-Null
     exit $Code
 }
+
+Start-InPersistentWindowIfNeeded
 
 if (-not (Get-Command psmux -ErrorAction SilentlyContinue)) {
     Write-Host "psmux not found，please install first："

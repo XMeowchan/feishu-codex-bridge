@@ -122,6 +122,29 @@ def split_command(command: str) -> list[str]:
         local_free(argv)
 
 
+def resolve_power_shell_executable() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def resolve_executable_command(executable_name: str) -> list[str]:
+    resolved = shutil.which(executable_name)
+    if not resolved:
+        return [executable_name]
+
+    resolved_path = Path(resolved)
+    if is_windows() and resolved_path.suffix.lower() == ".ps1":
+        power_shell = resolve_power_shell_executable()
+        if not power_shell:
+            return [resolved]
+        return [power_shell, "-ExecutionPolicy", "Bypass", "-File", resolved]
+
+    return [resolved]
+
+
+def build_lark_cli_command(*args: str) -> list[str]:
+    return [*resolve_executable_command("lark-cli"), *args]
+
+
 def build_bootstrap_prompt(skill_path: Path) -> str:
     shared_path = skill_path.parent.parent / "lark-shared" / "SKILL.md"
     return f"""你当前运行在飞书 P2P 桥接模式。
@@ -400,8 +423,7 @@ class LarkMessenger:
         if not text.strip():
             return True
 
-        command = [
-            "lark-cli",
+        command = build_lark_cli_command(
             "im",
             "+messages-reply",
             "--message-id",
@@ -410,7 +432,7 @@ class LarkMessenger:
             text,
             "--as",
             "bot",
-        ]
+        )
         self._logger.info("Replying to Feishu message %s", message_id)
         completed = subprocess.run(
             command,
@@ -466,7 +488,7 @@ class CodexSession:
         self._lark_cli_event_log_path = self._runtime_dir / f"{self._config.tmux_session_name}.lark-cli-events.jsonl"
         self._lark_cli_wrapper_path = Path(__file__).parent / lark_cli_wrapper_relative_path()
         self._lark_cli_wrapper_module_path = Path(__file__).parent / LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH
-        self._real_lark_cli_path = shutil.which("lark-cli") or "lark-cli"
+        self._real_lark_cli_command = resolve_executable_command("lark-cli")
         self._lark_event_thread: threading.Thread | None = None
 
     @property
@@ -486,7 +508,7 @@ class CodexSession:
             "COLORTERM": "truecolor",
             "COLUMNS": str(TMUX_COLUMNS),
             "LINES": str(TMUX_LINES),
-            "FEISHU_BRIDGE_REAL_LARK_CLI": self._real_lark_cli_path,
+            "FEISHU_BRIDGE_REAL_LARK_CLI_JSON": json.dumps(self._real_lark_cli_command),
             "FEISHU_BRIDGE_LARK_EVENT_LOG": str(self._lark_cli_event_log_path),
             "PATH": os.pathsep.join(path_entries),
         }
@@ -676,7 +698,7 @@ class CodexSession:
         shell_command = (
             f"export TERM=xterm-256color COLORTERM=truecolor "
             f"COLUMNS={TMUX_COLUMNS} LINES={TMUX_LINES}; "
-            f"export FEISHU_BRIDGE_REAL_LARK_CLI={shlex.quote(self._real_lark_cli_path)}; "
+            f"export FEISHU_BRIDGE_REAL_LARK_CLI_JSON={shlex.quote(json.dumps(self._real_lark_cli_command))}; "
             f"export FEISHU_BRIDGE_LARK_EVENT_LOG={shlex.quote(str(self._lark_cli_event_log_path))}; "
             f"export PATH={shlex.quote(str(self._lark_cli_wrapper_path.parent))}{os.pathsep}$PATH; "
             f"exec {self._config.command}"
@@ -1144,8 +1166,7 @@ class BridgeService:
                 time.sleep(SUBSCRIBE_RESTART_DELAY_SECONDS)
 
     def _run_subscribe_once(self) -> None:
-        command = [
-            "lark-cli",
+        command = build_lark_cli_command(
             "event",
             "+subscribe",
             "--event-types",
@@ -1154,7 +1175,7 @@ class BridgeService:
             "--quiet",
             "--as",
             "bot",
-        ]
+        )
         self._logger.info("Starting Feishu event subscription")
         with self._state_lock:
             self._subscription_started_at = time.monotonic()
@@ -1447,8 +1468,11 @@ def check_environment(config: BridgeConfig) -> list[str]:
         elif shutil.which(executable) is None:
             problems.append(f"command executable not found in PATH: {executable}")
 
-    if shutil.which("lark-cli") is None:
+    lark_cli_path = shutil.which("lark-cli")
+    if lark_cli_path is None:
         problems.append("lark-cli is not available in PATH")
+    elif is_windows() and Path(lark_cli_path).suffix.lower() == ".ps1" and resolve_power_shell_executable() is None:
+        problems.append("lark-cli resolves to a PowerShell script, but pwsh/powershell is not available in PATH")
 
     mux_name = mux_binary_name()
     if shutil.which(mux_name) is None:

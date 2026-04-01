@@ -103,15 +103,23 @@ def split_command(command: str) -> list[str]:
 
     import ctypes
 
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+
+    local_free = ctypes.windll.kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+
     argc = ctypes.c_int()
-    argv = ctypes.windll.shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    argv = command_line_to_argv(command, ctypes.byref(argc))
     if not argv:
         raise ValueError(f"failed to parse command: {command}")
 
     try:
         return [argv[index] for index in range(argc.value)]
     finally:
-        ctypes.windll.kernel32.LocalFree(argv)
+        local_free(argv)
 
 
 def build_bootstrap_prompt(skill_path: Path) -> str:

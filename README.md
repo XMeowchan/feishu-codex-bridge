@@ -2,7 +2,15 @@
 
 `feishu_codex_bridge` 是一个本地常驻守护工具，用来把飞书 P2P 私聊消息桥接到同一台机器上的长驻 `Codex CLI` 会话。
 
-从这版开始，`Codex` 不再跑在隐藏 PTY 里，而是固定运行在一个可 attach 的 `tmux` session 中。你可以随时进入这个 session 看真实界面，也可以 detach 后让它继续后台工作。
+从这版开始，`Codex` 不再跑在隐藏 PTY 里，而是固定运行在一个可 attach 的 `tmux` session 中。你可以从任意本机终端随时 attach 进去看真实界面、直接接手当前任务，也可以 detach 后让它继续后台工作。
+
+日常使用时，你可以全程只在飞书里给 `Codex` 发需求、看进度、收结果，不需要盯着本地终端。`tmux` 更像一个随时可进入的“驾驶舱”: 平时可以不打开，需要排障、观察真实 TUI、或者临时手动接管时再进去。
+
+## 核心特性
+
+- 全程飞书对话驱动：启动桥接后，日常工作流可以只在飞书里完成，需求、追问、进度同步、最终回复都走飞书线程
+- 任意终端可接手同一会话：`Codex` 固定跑在命名的 `tmux` session 里，你可以从任意本机终端 `attach` 到同一个会话继续操作
+- 会话可后台持续运行：你可以随时 `detach`，桥接服务和 `Codex` 会继续在后台工作，不要求终端窗口一直挂在前台
 
 它只做三件事：
 
@@ -124,7 +132,7 @@ Feishu event subscription is receiving events (first event observed)
 
 这两个文件都会用相对位置自动找到同目录下的 [bridge.py](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/bridge.py) 和 [bridge.toml](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/bridge.toml)。
 
-启动后可以随时查看真实 `Codex` 终端：
+启动后如果你想进入真实 `Codex` 界面，可以从任意本机终端执行：
 
 ```bash
 tmux attach -t feishu-codex-bridge
@@ -132,7 +140,7 @@ tmux attach -t feishu-codex-bridge
 
 如果你改了 `tmux_session_name`，把上面的名字换掉即可。
 
-在 `tmux` 里按 `Ctrl+b` 然后按 `d` 可以 detach，不会停止桥接服务。
+在 `tmux` 里按 `Ctrl+b` 然后按 `d` 可以 detach，不会停止桥接服务，也不会中断飞书侧的工作流。
 
 如果你只是想关闭当前 `tmux` 会话，但保留桥接服务继续运行：
 
@@ -161,7 +169,7 @@ lark-cli im +messages-reply --message-id <incoming_message_id> --text "<ack_text
 - 如果 `Codex` 在 10 秒内还没有主动通过飞书回用户，桥接层会自动补一条“仍在处理中”的 watchdog 提示；之后每 30 秒补一条心跳，直到 `Codex` 真正开始通过飞书回复或任务结束
 - 当前版本只处理订阅通道实时收到的消息；如果服务启动前或订阅建立窗口期有消息漏掉，桥接层不会补捞历史消息
 
-桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。
+桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。默认使用方式仍然是“人在飞书里发消息，`Codex` 在后台持续处理”，`tmux` 只是这个后台会话的可见入口。
 
 ## 行为边界
 
@@ -215,8 +223,9 @@ v1 固定行为：
 1. 启动桥接服务
 2. 等待本地终端出现 `Feishu event subscription ready (connection stable, you can now send messages from Feishu)`
 3. 再去飞书发送第一条普通消息，或者先发 `/status`
-4. 如果想看真实界面，执行 `tmux attach -t <tmux_session_name>`
-5. 如果当前任务卡住，先发 `/interrupt`；还不行再发 `/reset`
+4. 后续默认直接在飞书里持续对话、补充需求、接收结果，不需要一直打开本地终端
+5. 如果想看真实界面或临时手动接手当前会话，再从任意本机终端执行 `tmux attach -t <tmux_session_name>`
+6. 如果当前任务卡住，先发 `/interrupt`；还不行再发 `/reset`
 
 ## launchd
 

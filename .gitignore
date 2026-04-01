@@ -3,3 +3,4 @@ bridge.log
 __pycache__/
 *.pyc
 .idea/
+.DS_Store

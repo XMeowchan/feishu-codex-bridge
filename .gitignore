@@ -1,0 +1,5 @@
+bridge.toml
+bridge.log
+__pycache__/
+*.pyc
+.idea/

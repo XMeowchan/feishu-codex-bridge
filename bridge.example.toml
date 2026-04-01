@@ -1,0 +1,12 @@
+# Copy this file to `bridge.toml` and fill in the real values before running.
+# Relative paths are resolved from the folder where this TOML file lives.
+
+cwd = "../.."
+command = "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+allowed_sender_open_id = "ou_xxxxxxxxxxxxxxxxx"
+message_scope = "p2p"
+skill_path = "/ABSOLUTE/PATH/TO/YOUR/lark-im/SKILL.md"
+ack_text = "已收到，正在转给本地 Codex 处理，后续回复会直接回到这条消息下。"
+session_idle_minutes = 30
+log_path = "./bridge.log"
+tmux_session_name = "feishu-codex-bridge"

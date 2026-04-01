@@ -17,16 +17,16 @@ if %ERRORLEVEL% EQU 0 (
     goto after_run
 )
 
-echo 未找到 py 或 python，请先安装 Python。
+echo Could not find py or python. Please install Python first.
 set "RC=1"
 goto after_run
 
 :after_run
 echo.
 if not "%RC%"=="0" (
-    echo 桥接服务已退出，退出码：%RC%
+    echo Bridge service exited with code: %RC%
 ) else (
-    echo 桥接服务已退出。
+    echo Bridge service exited.
 )
 echo.
 pause

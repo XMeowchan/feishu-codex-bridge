@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import queue
 import re
 import shlex
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,8 +67,51 @@ TMUX_WHEEL_SCROLL_LINES = 3
 DEFAULT_TMUX_SESSION_NAME = "feishu-codex-bridge"
 LOG_DEDUP_WINDOW_SECONDS = 15.0
 RUNTIME_DIR_NAME = ".runtime"
+POSIX_MUX_BINARY = "tmux"
+WINDOWS_MUX_BINARY = "psmux"
 LARK_CLI_WRAPPER_RELATIVE_PATH = Path("bin") / "lark-cli"
+LARK_CLI_WRAPPER_WINDOWS_RELATIVE_PATH = Path("bin") / "lark-cli.cmd"
+LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH = Path("bin") / "lark_cli_wrapper.py"
 SEEN_MESSAGE_IDS_FILENAME = "seen_message_ids.txt"
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def mux_binary_name() -> str:
+    return WINDOWS_MUX_BINARY if is_windows() else POSIX_MUX_BINARY
+
+
+def mux_session_label() -> str:
+    return f"{mux_binary_name()} 会话"
+
+
+def mux_attach_command(session_name: str) -> str:
+    return f"{mux_binary_name()} attach -t {session_name}"
+
+
+def lark_cli_wrapper_relative_path() -> Path:
+    if is_windows():
+        return LARK_CLI_WRAPPER_WINDOWS_RELATIVE_PATH
+    return LARK_CLI_WRAPPER_RELATIVE_PATH
+
+
+def split_command(command: str) -> list[str]:
+    if not is_windows():
+        return shlex.split(command)
+
+    import ctypes
+
+    argc = ctypes.c_int()
+    argv = ctypes.windll.shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv:
+        raise ValueError(f"failed to parse command: {command}")
+
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
 
 
 def build_bootstrap_prompt(skill_path: Path) -> str:
@@ -220,18 +265,19 @@ def should_log_lark_event_stderr(text: str) -> bool:
     return True
 
 
-class TmuxCommandError(RuntimeError):
+class MuxCommandError(RuntimeError):
     pass
 
 
-def run_tmux(
+def run_mux(
     args: list[str],
     *,
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    mux_name = mux_binary_name()
     completed = subprocess.run(
-        ["tmux", *args],
+        [mux_name, *args],
         input=input_text,
         text=True,
         capture_output=True,
@@ -239,8 +285,8 @@ def run_tmux(
         errors="replace",
     )
     if check and completed.returncode != 0:
-        raise TmuxCommandError(
-            f"tmux {' '.join(args)} failed with code {completed.returncode}: {completed.stderr.strip()}"
+        raise MuxCommandError(
+            f"{mux_name} {' '.join(args)} failed with code {completed.returncode}: {completed.stderr.strip()}"
         )
     return completed
 
@@ -263,7 +309,7 @@ class BridgeConfig:
 
     @property
     def command_argv(self) -> list[str]:
-        return shlex.split(self.command)
+        return split_command(self.command)
 
 
 @dataclass(frozen=True)
@@ -407,15 +453,35 @@ class CodexSession:
         self._active_task_lock = threading.Lock()
         self._active_task: ActiveTaskState | None = None
         self._task_token_counter = 0
+        self._mux_name = mux_binary_name()
         self._runtime_dir = Path(__file__).parent / RUNTIME_DIR_NAME
         self._lark_cli_event_log_path = self._runtime_dir / f"{self._config.tmux_session_name}.lark-cli-events.jsonl"
-        self._lark_cli_wrapper_path = Path(__file__).parent / LARK_CLI_WRAPPER_RELATIVE_PATH
+        self._lark_cli_wrapper_path = Path(__file__).parent / lark_cli_wrapper_relative_path()
+        self._lark_cli_wrapper_module_path = Path(__file__).parent / LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH
         self._real_lark_cli_path = shutil.which("lark-cli") or "lark-cli"
         self._lark_event_thread: threading.Thread | None = None
 
     @property
-    def _tmux_target(self) -> str:
+    def _mux_target(self) -> str:
         return f"{self._config.tmux_session_name}:0.0"
+
+    def _attach_command(self) -> str:
+        return mux_attach_command(self._config.tmux_session_name)
+
+    def _session_environment(self) -> dict[str, str]:
+        path_entries = [str(self._lark_cli_wrapper_path.parent)]
+        if os.environ.get("PATH"):
+            path_entries.append(os.environ["PATH"])
+
+        return {
+            "TERM": "xterm-256color",
+            "COLORTERM": "truecolor",
+            "COLUMNS": str(TMUX_COLUMNS),
+            "LINES": str(TMUX_LINES),
+            "FEISHU_BRIDGE_REAL_LARK_CLI": self._real_lark_cli_path,
+            "FEISHU_BRIDGE_LARK_EVENT_LOG": str(self._lark_cli_event_log_path),
+            "PATH": os.pathsep.join(path_entries),
+        }
 
     def submit(self, message: IncomingMessage) -> None:
         self._task_queue.put(message)
@@ -438,7 +504,7 @@ class CodexSession:
                 True,
                 (
                     "已向当前 Codex 会话发送中断信号。\n"
-                    f"tmux 会话名：{self._config.tmux_session_name}\n"
+                    f"{mux_session_label()}名：{self._config.tmux_session_name}\n"
                     "如果这一轮仍未停止，可以继续发送 /reset 强制重建会话。"
                 ),
             )
@@ -466,14 +532,14 @@ class CodexSession:
         return "\n".join(
             [
                 "桥接状态：运行中",
-                f"tmux 会话名：{self._config.tmux_session_name}",
-                f"tmux 会话：{session_text}",
+                f"{mux_session_label()}名：{self._config.tmux_session_name}",
+                f"{mux_session_label()}：{session_text}",
                 f"会话引导：{bootstrap_text}",
                 f"处理中：{busy_text}",
                 f"排队消息数：{self.queue_length}",
                 f"上次任务完成后空闲：{idle_text}",
                 f"工作目录：{self._config.cwd}",
-                f"attach 命令：tmux attach -t {self._config.tmux_session_name}",
+                f"attach 命令：{self._attach_command()}",
             ]
         )
 
@@ -530,8 +596,8 @@ class CodexSession:
             command.message_id,
             (
                 "已重置本地 Codex 会话。\n"
-                f"新的 tmux 会话已就绪：{self._config.tmux_session_name}\n"
-                f"可查看：tmux attach -t {self._config.tmux_session_name}"
+                f"新的 {mux_session_label()}已就绪：{self._config.tmux_session_name}\n"
+                f"可查看：{self._attach_command()}"
             ),
         )
 
@@ -542,7 +608,7 @@ class CodexSession:
                 self._stop_process()
 
             if self._bootstrap_sent and not self._session_exists():
-                self._logger.warning("Codex tmux session disappeared, recreating it")
+                self._logger.warning("Codex %s disappeared, recreating it", mux_session_label())
                 self._stop_process()
 
             if not self._session_exists():
@@ -579,15 +645,35 @@ class CodexSession:
 
         self._prepare_runtime_files()
         self._logger.info("Starting Codex session: %s", self._config.command)
+        if is_windows():
+            self._start_windows_session(argv)
+        else:
+            self._start_posix_session()
+        self._configure_mux_session()
+        self._logger.info("%s session created: %s", self._mux_name, self._config.tmux_session_name)
+        self._logger.info("Attach with: %s", self._attach_command())
+        self._lark_event_thread = threading.Thread(
+            target=self._read_lark_cli_event_loop,
+            name="codex-lark-cli-event-reader",
+            daemon=True,
+        )
+        self._lark_event_thread.start()
+        self._reader_thread = threading.Thread(target=self._read_output_loop, name="codex-output-reader", daemon=True)
+        self._reader_thread.start()
+
+        if not self._ui_ready.wait(timeout=SESSION_STARTUP_TIMEOUT_SECONDS):
+            self._logger.warning("Codex startup prompt was not detected within %.1fs", SESSION_STARTUP_TIMEOUT_SECONDS)
+
+    def _start_posix_session(self) -> None:
         shell_command = (
             f"export TERM=xterm-256color COLORTERM=truecolor "
             f"COLUMNS={TMUX_COLUMNS} LINES={TMUX_LINES}; "
             f"export FEISHU_BRIDGE_REAL_LARK_CLI={shlex.quote(self._real_lark_cli_path)}; "
             f"export FEISHU_BRIDGE_LARK_EVENT_LOG={shlex.quote(str(self._lark_cli_event_log_path))}; "
-            f"export PATH={shlex.quote(str(self._lark_cli_wrapper_path.parent))}:$PATH; "
+            f"export PATH={shlex.quote(str(self._lark_cli_wrapper_path.parent))}{os.pathsep}$PATH; "
             f"exec {self._config.command}"
         )
-        run_tmux(
+        run_mux(
             [
                 "new-session",
                 "-d",
@@ -602,34 +688,50 @@ class CodexSession:
                 shell_command,
             ]
         )
-        self._configure_tmux_session()
-        self._logger.info("tmux session created: %s", self._config.tmux_session_name)
-        self._logger.info("Attach with: tmux attach -t %s", self._config.tmux_session_name)
-        self._lark_event_thread = threading.Thread(
-            target=self._read_lark_cli_event_loop,
-            name="codex-lark-cli-event-reader",
-            daemon=True,
+
+    def _start_windows_session(self, argv: list[str]) -> None:
+        run_mux(
+            [
+                "new-session",
+                "-d",
+                "-s",
+                self._config.tmux_session_name,
+                "-x",
+                str(TMUX_COLUMNS),
+                "-y",
+                str(TMUX_LINES),
+                "-c",
+                str(self._config.cwd),
+            ]
         )
-        self._lark_event_thread.start()
-        self._reader_thread = threading.Thread(target=self._read_output_loop, name="codex-output-reader", daemon=True)
-        self._reader_thread.start()
+        for key, value in self._session_environment().items():
+            run_mux(["set-environment", "-t", self._config.tmux_session_name, key, value])
+        run_mux(
+            [
+                "respawn-pane",
+                "-k",
+                "-t",
+                self._mux_target,
+                "-c",
+                str(self._config.cwd),
+                "--",
+                *argv,
+            ]
+        )
 
-        if not self._ui_ready.wait(timeout=SESSION_STARTUP_TIMEOUT_SECONDS):
-            self._logger.warning("Codex startup prompt was not detected within %.1fs", SESSION_STARTUP_TIMEOUT_SECONDS)
-
-    def _configure_tmux_session(self) -> None:
+    def _configure_mux_session(self) -> None:
         session_target = self._config.tmux_session_name
         window_target = f"{session_target}:0"
         scroll_lines = str(TMUX_WHEEL_SCROLL_LINES)
 
-        run_tmux(["set-option", "-t", session_target, "mouse", "on"], check=False)
-        run_tmux(["set-window-option", "-t", window_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
-        run_tmux(["set-window-option", "-t", window_target, "mode-keys", "vi"], check=False)
+        run_mux(["set-option", "-t", session_target, "mouse", "on"], check=False)
+        run_mux(["set-window-option", "-t", window_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
+        run_mux(["set-window-option", "-t", window_target, "mode-keys", "vi"], check=False)
 
-        # Prefer tmux copy-mode scrolling over passing wheel events through to Codex.
-        run_tmux(["unbind-key", "-T", "root", "WheelUpPane"], check=False)
-        run_tmux(["unbind-key", "-T", "root", "WheelDownPane"], check=False)
-        run_tmux(
+        # Prefer mux copy-mode scrolling over passing wheel events through to Codex.
+        run_mux(["unbind-key", "-T", "root", "WheelUpPane"], check=False)
+        run_mux(["unbind-key", "-T", "root", "WheelDownPane"], check=False)
+        run_mux(
             [
                 "bind-key",
                 "-T",
@@ -643,7 +745,7 @@ class CodexSession:
             ],
             check=False,
         )
-        run_tmux(
+        run_mux(
             [
                 "bind-key",
                 "-T",
@@ -664,13 +766,13 @@ class CodexSession:
 
         if self._session_exists():
             try:
-                run_tmux(["send-keys", "-t", self._tmux_target, "/quit", "Enter"], check=False)
+                run_mux(["send-keys", "-t", self._mux_target, "/quit", "Enter"], check=False)
                 time.sleep(1.0)
-            except TmuxCommandError:
+            except MuxCommandError:
                 pass
 
             if self._session_exists():
-                run_tmux(["kill-session", "-t", self._config.tmux_session_name], check=False)
+                run_mux(["kill-session", "-t", self._config.tmux_session_name], check=False)
 
         reader_thread = self._reader_thread
         if reader_thread and reader_thread.is_alive():
@@ -723,16 +825,16 @@ class CodexSession:
             self._ui_ready.set()
 
     def _session_exists(self) -> bool:
-        return run_tmux(["has-session", "-t", self._config.tmux_session_name], check=False).returncode == 0
+        return run_mux(["has-session", "-t", self._config.tmux_session_name], check=False).returncode == 0
 
     def _capture_snapshot(self) -> str | None:
-        completed = run_tmux(
+        completed = run_mux(
             [
                 "capture-pane",
                 "-p",
                 "-J",
                 "-t",
-                self._tmux_target,
+                self._mux_target,
                 "-S",
                 f"-{TMUX_CAPTURE_HISTORY_LINES}",
             ],
@@ -743,11 +845,19 @@ class CodexSession:
         return completed.stdout
 
     def _send_keys(self, *keys: str) -> None:
-        run_tmux(["send-keys", "-t", self._tmux_target, *keys])
+        run_mux(["send-keys", "-t", self._mux_target, *keys])
 
     def _paste_text(self, text: str) -> None:
-        run_tmux(["load-buffer", "-"], input_text=text)
-        run_tmux(["paste-buffer", "-d", "-t", self._tmux_target])
+        prompt_path = self._runtime_dir / f"prompt-{uuid.uuid4().hex}.txt"
+        prompt_path.write_text(text, encoding="utf-8")
+        try:
+            run_mux(["load-buffer", str(prompt_path)])
+            run_mux(["paste-buffer", "-d", "-t", self._mux_target])
+        finally:
+            try:
+                prompt_path.unlink()
+            except OSError:
+                pass
 
     def _send_submit_key(self) -> None:
         self._send_keys("C-m")
@@ -781,7 +891,7 @@ class CodexSession:
 
     def _submit_prompt(self, prompt: str, *, prompt_name: str) -> None:
         if not self._session_exists():
-            raise RuntimeError("Codex tmux session is not running")
+            raise RuntimeError(f"Codex {self._mux_name} session is not running")
 
         if not self._ui_ready.is_set():
             self._ui_ready.wait(timeout=SESSION_STARTUP_TIMEOUT_SECONDS)
@@ -807,7 +917,7 @@ class CodexSession:
 
         while not self._shutdown.is_set():
             if not self._session_exists():
-                raise RuntimeError(f"Codex tmux session disappeared while handling {prompt_name}")
+                raise RuntimeError(f"Codex {self._mux_name} session disappeared while handling {prompt_name}")
 
             with self._output_lock:
                 last_output = self._last_output_at
@@ -838,6 +948,8 @@ class CodexSession:
         self._lark_cli_event_log_path.write_text("", encoding="utf-8")
         if not self._lark_cli_wrapper_path.exists():
             raise RuntimeError(f"Missing lark-cli wrapper: {self._lark_cli_wrapper_path}")
+        if not self._lark_cli_wrapper_module_path.exists():
+            raise RuntimeError(f"Missing lark-cli wrapper module: {self._lark_cli_wrapper_module_path}")
 
     def _begin_active_task(self, message_id: str, chat_id: str, sender_id: str) -> int:
         with self._active_task_lock:
@@ -1233,7 +1345,7 @@ class BridgeService:
                 (
                     "已收到重置请求，会按当前顺序执行。\n"
                     f"当前排队消息数：{queue_length}\n"
-                    f"tmux 会话名：{self._config.tmux_session_name}"
+                    f"{mux_session_label()}名：{self._config.tmux_session_name}"
                 ),
             )
             return
@@ -1321,7 +1433,7 @@ def check_environment(config: BridgeConfig) -> list[str]:
         problems.append("command is empty after parsing")
     else:
         executable = command_argv[0]
-        if "/" in executable:
+        if "/" in executable or "\\" in executable:
             if not Path(executable).expanduser().exists():
                 problems.append(f"command executable does not exist: {executable}")
         elif shutil.which(executable) is None:
@@ -1330,12 +1442,20 @@ def check_environment(config: BridgeConfig) -> list[str]:
     if shutil.which("lark-cli") is None:
         problems.append("lark-cli is not available in PATH")
 
-    if shutil.which("tmux") is None:
-        problems.append("tmux is not available in PATH")
+    mux_name = mux_binary_name()
+    if shutil.which(mux_name) is None:
+        if is_windows():
+            problems.append("psmux is not available in PATH. Install it with: winget install psmux")
+        else:
+            problems.append("tmux is not available in PATH")
 
-    wrapper_path = Path(__file__).parent / LARK_CLI_WRAPPER_RELATIVE_PATH
+    wrapper_path = Path(__file__).parent / lark_cli_wrapper_relative_path()
     if not wrapper_path.exists():
         problems.append(f"lark-cli wrapper does not exist: {wrapper_path}")
+
+    wrapper_module_path = Path(__file__).parent / LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH
+    if not wrapper_module_path.exists():
+        problems.append(f"lark-cli wrapper module does not exist: {wrapper_module_path}")
 
     return problems
 

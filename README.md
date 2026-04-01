@@ -2,14 +2,14 @@
 
 `feishu_codex_bridge` 是一个本地常驻守护工具，用来把飞书 P2P 私聊消息桥接到同一台机器上的长驻 `Codex CLI` 会话。
 
-从这版开始，`Codex` 不再跑在隐藏 PTY 里，而是固定运行在一个可 attach 的 `tmux` session 中。你可以从任意本机终端随时 attach 进去看真实界面、直接接手当前任务，也可以 detach 后让它继续后台工作。
+从这版开始，`Codex` 不再跑在隐藏 PTY 里，而是固定运行在一个可 attach 的 mux session 中：macOS / Linux 使用 `tmux`，Windows 原生使用 `psmux`。你可以从任意本机终端随时 attach 进去看真实界面、直接接手当前任务，也可以 detach 后让它继续后台工作。
 
-日常使用时，你可以全程只在飞书里给 `Codex` 发需求、看进度、收结果，不需要盯着本地终端。`tmux` 更像一个随时可进入的“驾驶舱”: 平时可以不打开，需要排障、观察真实 TUI、或者临时手动接管时再进去。
+日常使用时，你可以全程只在飞书里给 `Codex` 发需求、看进度、收结果，不需要盯着本地终端。这个 mux 会话更像一个随时可进入的“驾驶舱”: 平时可以不打开，需要排障、观察真实 TUI、或者临时手动接管时再进去。
 
 ## 核心特性
 
 - 全程飞书对话驱动：启动桥接后，日常工作流可以只在飞书里完成，需求、追问、进度同步、最终回复都走飞书线程
-- 任意终端可接手同一会话：`Codex` 固定跑在命名的 `tmux` session 里，你可以从任意本机终端 `attach` 到同一个会话继续操作
+- 任意终端可接手同一会话：`Codex` 固定跑在命名的 mux session 里，你可以从任意本机终端 `attach` 到同一个会话继续操作
 - 会话可后台持续运行：你可以随时 `detach`，桥接服务和 `Codex` 会继续在后台工作，不要求终端窗口一直挂在前台
 
 它只做三件事：
@@ -34,7 +34,8 @@
 本机需要满足：
 
 - `python3` 可用
-- `tmux` 可用
+- macOS / Linux：`tmux` 可用
+- Windows：`psmux` 可用
 - `lark-cli` 已安装并完成 `lark-cli config init`
 - 飞书开放平台已开启长连接事件订阅
 - 已添加 `im.message.receive_v1`
@@ -81,7 +82,7 @@ tmux_session_name = "feishu-codex-bridge"
 - `ack_text`: 服务收到有效消息后立即回的确认文案
 - `session_idle_minutes`: 会话空闲多久后自动重建
 - `log_path`: 本地日志文件
-- `tmux_session_name`: 长驻 `tmux` 会话名，后续可用它 attach 进去
+- `tmux_session_name`: 长驻 mux 会话名。字段名保持不变；macOS / Linux 下对应 `tmux` 会话名，Windows 下对应 `psmux` 会话名
 
 补充说明：
 
@@ -127,10 +128,10 @@ Feishu event subscription is receiving events (first event observed)
 
 如果你希望直接双击启动：
 
-- macOS：双击 [start_bridge.command](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/start_bridge.command)
-- Windows：双击 [start_bridge.cmd](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/start_bridge.cmd)
+- macOS：双击 [start_bridge.command](start_bridge.command)
+- Windows：双击 [start_bridge.cmd](start_bridge.cmd)
 
-这两个文件都会用相对位置自动找到同目录下的 [bridge.py](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/bridge.py) 和 [bridge.toml](/Volumes/M.2/WorkSpace/OwMini/Tools/feishu_codex_bridge/bridge.toml)。
+这两个文件都会用相对位置自动找到同目录下的 [bridge.py](bridge.py) 和 `bridge.toml`。
 
 启动后如果你想进入真实 `Codex` 界面，可以从任意本机终端执行：
 
@@ -138,17 +139,38 @@ Feishu event subscription is receiving events (first event observed)
 tmux attach -t feishu-codex-bridge
 ```
 
+Windows 原生请改用：
+
+```powershell
+psmux attach -t feishu-codex-bridge
+```
+
 如果你改了 `tmux_session_name`，把上面的名字换掉即可。
 
-在 `tmux` 里按 `Ctrl+b` 然后按 `d` 可以 detach，不会停止桥接服务，也不会中断飞书侧的工作流。
+在 `tmux` / `psmux` 里 detach 不会停止桥接服务，也不会中断飞书侧的工作流。
 
-如果你只是想关闭当前 `tmux` 会话，但保留桥接服务继续运行：
+如果你只是想关闭当前 mux 会话，但保留桥接服务继续运行：
 
 ```bash
 tmux kill-session -t feishu-codex-bridge
 ```
 
-下次再收到普通飞书消息时，桥接服务会自动重建一个新的 `tmux` 会话。
+Windows 原生对应命令是：
+
+```powershell
+psmux kill-session -t feishu-codex-bridge
+```
+
+下次再收到普通飞书消息时，桥接服务会自动重建一个新的 mux 会话。
+
+## Windows 原生运行
+
+如果你在 Windows 原生环境运行，不需要 WSL。桥接会直接使用 `psmux` 作为 `tmux` 的平替。
+
+- 先安装 `psmux`：`winget install psmux`
+- `start_bridge.cmd` 启动前会先检查 `psmux` 是否可用；如果没装，会直接提示安装命令
+- `bridge.py --check` 在 Windows 上也会检查 `psmux`，不会再报泛化的 `tmux is not available in PATH`
+- `cwd`、`skill_path`、`log_path` 请填写 Windows 本机可访问的路径；如果你用的是 Windows 版 `python`、`codex`、`lark-cli`，就按 Windows 路径来写
 
 ## 工作方式
 
@@ -169,7 +191,7 @@ lark-cli im +messages-reply --message-id <incoming_message_id> --text "<ack_text
 - 如果 `Codex` 在 10 秒内还没有主动通过飞书回用户，桥接层会自动补一条“仍在处理中”的 watchdog 提示；之后每 30 秒补一条心跳，直到 `Codex` 真正开始通过飞书回复或任务结束
 - 当前版本只处理订阅通道实时收到的消息；如果服务启动前或订阅建立窗口期有消息漏掉，桥接层不会补捞历史消息
 
-桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。默认使用方式仍然是“人在飞书里发消息，`Codex` 在后台持续处理”，`tmux` 只是这个后台会话的可见入口。
+桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。默认使用方式仍然是“人在飞书里发消息，`Codex` 在后台持续处理”，mux 会话只是这个后台会话的可见入口。
 
 ## 行为边界
 
@@ -180,15 +202,15 @@ v1 固定行为：
 - 只接收 `text` / `post` 两类文本可读消息
 - 图片、文件、卡片等消息会收到“当前仅支持文本消息”
 - `Codex` 输出只记本地日志，不自动桥接回飞书
-- 桥接日志会尽量压缩 TUI 噪音；完整画面请直接 `tmux attach`
+- 桥接日志会尽量压缩 TUI 噪音；完整画面请直接 attach 到当前 mux 会话
 
 ## 控制命令
 
 私聊机器人时，除了普通消息，还支持下面这些桥接层原生命令：
 
-- `/status`：立即返回桥接状态，包括当前 `tmux` 会话是否在线、是否正在处理、排队消息数、工作目录以及 attach 命令
-- `/reset`：按当前消息顺序重置会话。执行到这条命令时，会销毁旧的 `Codex` 会话并立刻创建一个新的 `tmux` 会话，然后回复你新的会话已就绪
-- `/interrupt`：立即向当前 `tmux` 中的 `Codex` 会话发送中断信号，尝试停止当前这一轮处理，但不重建整个会话
+- `/status`：立即返回桥接状态，包括当前 mux 会话是否在线、是否正在处理、排队消息数、工作目录以及 attach 命令
+- `/reset`：按当前消息顺序重置会话。执行到这条命令时，会销毁旧的 `Codex` 会话并立刻创建一个新的 mux 会话，然后回复你新的会话已就绪
+- `/interrupt`：立即向当前 mux 会话中的 `Codex` 发送中断信号，尝试停止当前这一轮处理，但不重建整个会话
 
 推荐把它们理解成“桥接层保留命令”，而不是交给 `Codex` 解释的普通对话。
 
@@ -224,7 +246,7 @@ v1 固定行为：
 2. 等待本地终端出现 `Feishu event subscription ready (connection stable, you can now send messages from Feishu)`
 3. 再去飞书发送第一条普通消息，或者先发 `/status`
 4. 后续默认直接在飞书里持续对话、补充需求、接收结果，不需要一直打开本地终端
-5. 如果想看真实界面或临时手动接手当前会话，再从任意本机终端执行 `tmux attach -t <tmux_session_name>`
+5. 如果想看真实界面或临时手动接手当前会话，再从任意本机终端执行 attach 命令：macOS / Linux 用 `tmux attach -t <tmux_session_name>`，Windows 用 `psmux attach -t <tmux_session_name>`
 6. 如果当前任务卡住，先发 `/interrupt`；还不行再发 `/reset`
 
 ## launchd
@@ -245,7 +267,7 @@ launchctl load ~/Library/LaunchAgents/com.example.feishu-codex-bridge.plist
 - `Codex` 无法读取技能：检查 `command` 的权限模式，确保它能访问 `skill_path`
 - 日志里看到 `Do you trust the contents of this directory?`：首次运行时脚本会自动确认
 - 日志里看到 `Continue anyway? [y/N]`：脚本会自动接受兼容提示，并为子进程设置 `TERM=xterm-256color`
-- 想看真正的交互界面：执行 `tmux attach -t <tmux_session_name>`
+- 想看真正的交互界面：按平台执行 attach 命令；macOS / Linux 用 `tmux attach -t <tmux_session_name>`，Windows 用 `psmux attach -t <tmux_session_name>`
 
 ## License
 

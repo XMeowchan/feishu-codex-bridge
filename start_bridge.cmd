@@ -3,6 +3,14 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 
+where psmux >nul 2>nul
+if not %ERRORLEVEL% EQU 0 (
+    echo 未找到 psmux，请先安装：
+    echo   winget install psmux
+    set "RC=1"
+    goto after_run
+)
+
 where py >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
     py -3 "%SCRIPT_DIR%start_bridge.py"

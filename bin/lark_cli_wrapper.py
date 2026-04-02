@@ -37,6 +37,51 @@ def append_event(event_path: str, payload: dict[str, object]) -> None:
         file.flush()
 
 
+def has_flag(args: list[str], flag: str) -> bool:
+    prefix = f"{flag}="
+    return any(arg == flag or arg.startswith(prefix) for arg in args)
+
+
+def normalize_legacy_im_args(args: list[str]) -> list[str]:
+    if len(args) < 3:
+        return args
+
+    head = tuple(args[:2])
+    rest = args[2:]
+
+    if head == ("im", "+messages-reply") and not has_flag(rest, "--message-id"):
+        if len(rest) >= 1:
+            message_id = rest[0]
+            text = rest[1] if len(rest) >= 2 else ""
+            identity = rest[2] if len(rest) >= 3 else ""
+            normalized = ["im", "+messages-reply", "--message-id", message_id]
+            if text:
+                normalized.extend(["--text", text])
+            if identity:
+                normalized.extend(["--as", identity])
+            return normalized
+
+    if head == ("im", "+messages-send") and not (
+        has_flag(rest, "--chat-id") or has_flag(rest, "--user-id")
+    ):
+        if len(rest) >= 1:
+            target = rest[0]
+            text = rest[1] if len(rest) >= 2 else ""
+            identity = rest[2] if len(rest) >= 3 else ""
+            normalized = ["im", "+messages-send"]
+            if target.startswith("ou_"):
+                normalized.extend(["--user-id", target])
+            else:
+                normalized.extend(["--chat-id", target])
+            if text:
+                normalized.extend(["--text", text])
+            if identity:
+                normalized.extend(["--as", identity])
+            return normalized
+
+    return args
+
+
 def main() -> int:
     real_lark_cli_command_json = os.environ.get("FEISHU_BRIDGE_REAL_LARK_CLI_JSON", "").strip()
     if real_lark_cli_command_json:
@@ -57,7 +102,7 @@ def main() -> int:
             return 127
         real_lark_cli_command = [real_lark_cli]
 
-    args = sys.argv[1:]
+    args = normalize_legacy_im_args(sys.argv[1:])
     kind = INTERESTING_COMMANDS.get(tuple(args[:2]), "")
     if "--help" in args or "-h" in args:
         kind = ""

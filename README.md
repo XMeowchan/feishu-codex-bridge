@@ -1,6 +1,8 @@
 # Feishu Codex Bridge
 
-`feishu_codex_bridge` 是一个本地常驻守护工具，用来把飞书 P2P 私聊消息桥接到同一台机器上的长驻 `Codex CLI` 会话。
+`feishu_codex_bridge` 是一个基于 `lark-cli` 的本地常驻守护工具，用来把飞书 P2P 私聊消息桥接到同一台机器上的长驻 `Codex CLI` 会话。
+
+它的重点不是再造一层飞书协议封装，而是直接复用 `lark-cli` 已有的事件订阅、身份认证、消息回复与技能调用能力，把飞书入口接到本地 `Codex` 代理上。桥接层本身很薄，但背后的 `Codex` 会话可以直接调用本机已安装、已授权的 `lark-*` skills，而不只是回一条 IM 消息。
 
 从这版开始，`Codex` 不再跑在隐藏 PTY 里，而是固定运行在一个可 attach 的 mux session 中：macOS / Linux 使用 `tmux`，Windows 原生使用 `psmux`。你可以从任意本机终端随时 attach 进去看真实界面、直接接手当前任务，也可以 detach 后让它继续后台工作。
 
@@ -8,6 +10,8 @@
 
 ## 核心特性
 
+- 基于 `lark-cli` 能力栈：消息订阅、身份、回消息、技能调用都建立在现成的 `lark-cli` / `lark-*` skills 之上，不额外发明一套飞书接入方式
+- `Codex` 可直接操作全部飞书 skills：只要当前机器上的 `Codex` 环境里已经安装并可访问对应的 `lark-*` skills，它就能直接调用，例如 `lark-im`、`lark-doc`、`lark-sheets`、`lark-base`、`lark-calendar`、`lark-task` 等
 - 全程飞书对话驱动：启动桥接后，日常工作流可以只在飞书里完成，需求、追问、进度同步、最终回复都走飞书线程
 - 任意终端可接手同一会话：`Codex` 固定跑在命名的 mux session 里，你可以从任意本机终端 `attach` 到同一个会话继续操作
 - 会话可后台持续运行：你可以随时 `detach`，桥接服务和 `Codex` 会继续在后台工作，不要求终端窗口一直挂在前台
@@ -16,7 +20,7 @@
 
 1. 用 `lark-cli event +subscribe --event-types im.message.receive_v1 --compact --quiet --as bot` 订阅飞书消息
 2. 只接收指定 `allowed_sender_open_id` 的 `p2p` 消息
-3. 把消息送进本地 `Codex CLI` 会话，并要求 `Codex` 自己通过 `lark-im` 回消息
+3. 把消息送进本地 `Codex CLI` 会话，并要求 `Codex` 优先通过 `lark-im` 回消息；如有需要，再继续调用本机可用的其他飞书 skills 去完成文档、表格、日历、任务、知识库等操作
 
 桥接层不会把 `stdout/stderr` 自动发回飞书；终端输出只用于本地日志和诊断。
 
@@ -38,6 +42,7 @@
 - macOS / Linux：`tmux` 可用
 - Windows：`psmux` 可用
 - `lark-cli` 已安装并完成 `lark-cli config init`
+- `Codex` 运行环境可以访问你希望它使用的 `lark-*` skills
 - 飞书开放平台已开启长连接事件订阅
 - 已添加 `im.message.receive_v1`
 - 已开通 `im:message:receive_as_bot`
@@ -79,7 +84,7 @@ tmux_session_name = "feishu-codex-bridge"
 - `command`: 原样执行的 `Codex` 启动命令
 - `allowed_sender_open_id`: 只允许这个飞书用户触发
 - `message_scope`: v1 固定为 `p2p`
-- `skill_path`: 注入给 `Codex` 的 `lark-im` 技能文件路径
+- `skill_path`: 注入给 `Codex` 的默认回复技能文件路径，通常填 `lark-im`，用于明确“先通过飞书把进度和结果回出去”
 - `ack_text`: 服务收到有效消息后立即回的确认文案
 - `session_idle_minutes`: 会话空闲多久后自动重建
 - `log_path`: 本地日志文件
@@ -90,6 +95,7 @@ tmux_session_name = "feishu-codex-bridge"
 - `cwd`、`skill_path`、`log_path` 都支持相对路径
 - 相对路径会以 `bridge.toml` 所在目录作为基准来解析
 - 如果你把整个 `feishu_codex_bridge` 文件夹打包发给别人，别人通常至少需要改这三项：`cwd`、`allowed_sender_open_id`、`skill_path`
+- `skill_path` 只是桥接启动时注入给 `Codex` 的默认沟通入口，不代表 `Codex` 只能用这一个 skill；只要同一环境里的其他 `lark-*` skills 可用，`Codex` 也可以直接调用
 
 ## 运行
 
@@ -151,6 +157,8 @@ psmux attach -t feishu-codex-bridge
 
 在 `tmux` / `psmux` 里 detach 不会停止桥接服务，也不会中断飞书侧的工作流。
 
+如果你的 `Codex` 环境本来就装有完整的飞书 skills，这个桥接启动后，等于就是把“飞书私聊”直接变成了这些 skills 的远程入口：你在飞书里提需求，`Codex` 可以在本机直接调用 `lark-cli` 和对应 `lark-*` skills 去查文档、改表格、发消息、查日历、写任务，而结果仍然回到同一条飞书线程里。
+
 如果你只是想关闭当前 mux 会话，但保留桥接服务继续运行：
 
 ```bash
@@ -192,6 +200,8 @@ lark-cli im +messages-reply --message-id <incoming_message_id> --text "<ack_text
 - 不要等所有回答完成才一起发，收到消息后先发一条简短进度，再在处理中持续追加回复
 - 如果 `Codex` 在 10 秒内还没有主动通过飞书回用户，桥接层会自动补一条“仍在处理中”的 watchdog 提示；之后每 30 秒补一条心跳，直到 `Codex` 真正开始通过飞书回复或任务结束
 - 当前版本只处理订阅通道实时收到的消息；如果服务启动前或订阅建立窗口期有消息漏掉，桥接层不会补捞历史消息
+
+这里的“优先使用 `lark-im`”是为了保证用户能先收到进度和结果，不是为了限制 `Codex` 的能力边界。只要你的本地 `Codex` 会话里可访问其他飞书 skills，它在处理任务时也可以直接继续调用这些 skill。
 
 桥接层会自动创建并复用配置里的 `tmux_session_name`；如果会话空闲超时，服务会销毁旧 session 并在下一条消息到来时重建。默认使用方式仍然是“人在飞书里发消息，`Codex` 在后台持续处理”，mux 会话只是这个后台会话的可见入口。
 

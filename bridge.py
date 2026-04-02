@@ -42,6 +42,7 @@ ASCII_LOG_KEYWORDS = (
     "Explored",
     "lark-cli",
 )
+SHELL_PROMPT_RE = re.compile(r"(?mi)^[A-Z]:\\[^>\r\n]*>")
 
 DEFAULT_ACK_TEXT = "已收到，正在转给本地 Codex 处理，后续回复会直接回到这条消息下。"
 UNSUPPORTED_MESSAGE_TEXT = "当前仅支持文本消息，请直接发送文字内容。"
@@ -126,12 +127,37 @@ def resolve_power_shell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell")
 
 
+def resolve_lark_cli_node_command(resolved_path: Path) -> list[str] | None:
+    if not is_windows() or resolved_path.suffix.lower() != ".cmd":
+        return None
+
+    run_js = resolved_path.parent / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
+    if not run_js.exists():
+        return None
+
+    node_executable = resolved_path.parent / "node.exe"
+    node_command = str(node_executable) if node_executable.exists() else shutil.which("node")
+    if not node_command:
+        return None
+
+    return [node_command, str(run_js)]
+
+
+def quote_power_shell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def resolve_executable_command(executable_name: str) -> list[str]:
     resolved = shutil.which(executable_name)
     if not resolved:
         return [executable_name]
 
     resolved_path = Path(resolved)
+    if executable_name == "lark-cli":
+        node_command = resolve_lark_cli_node_command(resolved_path)
+        if node_command:
+            return node_command
+
     if is_windows() and resolved_path.suffix.lower() == ".ps1":
         power_shell = resolve_power_shell_executable()
         if not power_shell:
@@ -418,12 +444,23 @@ class MessageDeduper:
 class LarkMessenger:
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger
+        self._wrapper_module_path = Path(__file__).parent / LARK_CLI_WRAPPER_MODULE_RELATIVE_PATH
+        self._real_lark_cli_command = resolve_executable_command("lark-cli")
+
+    def _build_command(self, *args: str) -> tuple[list[str], dict[str, str] | None]:
+        if not self._wrapper_module_path.exists():
+            return build_lark_cli_command(*args), None
+
+        env = os.environ.copy()
+        env["FEISHU_BRIDGE_REAL_LARK_CLI_JSON"] = json.dumps(self._real_lark_cli_command)
+        env.pop("FEISHU_BRIDGE_LARK_EVENT_LOG", None)
+        return [sys.executable, str(self._wrapper_module_path), *args], env
 
     def reply_text(self, message_id: str, text: str) -> bool:
         if not text.strip():
             return True
 
-        command = build_lark_cli_command(
+        command, env = self._build_command(
             "im",
             "+messages-reply",
             "--message-id",
@@ -440,6 +477,7 @@ class LarkMessenger:
             capture_output=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         if completed.returncode == 0:
             return True
@@ -497,6 +535,11 @@ class CodexSession:
 
     def _attach_command(self) -> str:
         return mux_attach_command(self._config.tmux_session_name)
+
+    @property
+    def _windows_launcher_path(self) -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self._config.tmux_session_name)
+        return self._runtime_dir / f"{safe_name}.launcher.ps1"
 
     def _session_environment(self) -> dict[str, str]:
         path_entries = [str(self._lark_cli_wrapper_path.parent)]
@@ -644,6 +687,11 @@ class CodexSession:
             if not self._session_exists():
                 self._start_process()
 
+            if not self._bootstrap_sent and not self._session_looks_like_codex():
+                self._logger.warning("Existing %s does not look like a Codex UI, recreating it", mux_session_label())
+                self._stop_process()
+                self._start_process()
+
             if not self._bootstrap_sent:
                 bootstrap = build_bootstrap_prompt(self._config.skill_path)
                 self._submit_prompt(bootstrap, prompt_name="bootstrap")
@@ -720,6 +768,11 @@ class CodexSession:
         )
 
     def _start_windows_session(self, argv: list[str]) -> None:
+        power_shell = resolve_power_shell_executable()
+        if not power_shell:
+            raise RuntimeError("PowerShell is required to launch Codex inside psmux on Windows")
+
+        launcher_command = self._write_windows_launcher(argv, power_shell)
         run_mux(
             [
                 "new-session",
@@ -732,22 +785,48 @@ class CodexSession:
                 str(TMUX_LINES),
                 "-c",
                 str(self._config.cwd),
-            ]
-        )
-        for key, value in self._session_environment().items():
-            run_mux(["set-environment", "-t", self._config.tmux_session_name, key, value])
-        run_mux(
-            [
-                "respawn-pane",
-                "-k",
-                "-t",
-                self._mux_target,
-                "-c",
-                str(self._config.cwd),
                 "--",
-                *argv,
+                *launcher_command,
             ]
         )
+
+    def _write_windows_launcher(self, argv: list[str], power_shell: str) -> list[str]:
+        launcher_path = self._windows_launcher_path
+        launcher_lines = [
+            "$ErrorActionPreference = 'Stop'",
+        ]
+        for key, value in self._session_environment().items():
+            launcher_lines.append(f"$env:{key} = {quote_power_shell_literal(value)}")
+
+        launcher_lines.extend(
+            [
+                f"Set-Location -LiteralPath {quote_power_shell_literal(str(self._config.cwd))}",
+                f"$exe = {quote_power_shell_literal(argv[0])}",
+                "$args = @(",
+            ]
+        )
+        launcher_lines.extend(f"    {quote_power_shell_literal(arg)}" for arg in argv[1:])
+        launcher_lines.extend(
+            [
+                ")",
+                "if ($args.Count -gt 0) {",
+                "    & $exe @args",
+                "} else {",
+                "    & $exe",
+                "}",
+                "exit $LASTEXITCODE",
+            ]
+        )
+        launcher_path.write_text("\r\n".join(launcher_lines) + "\r\n", encoding="utf-8-sig")
+        return [
+            power_shell,
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher_path),
+        ]
 
     def _configure_mux_session(self) -> None:
         session_target = self._config.tmux_session_name
@@ -755,6 +834,13 @@ class CodexSession:
         scroll_lines = str(TMUX_WHEEL_SCROLL_LINES)
 
         run_mux(["set-option", "-t", session_target, "mouse", "on"], check=False)
+
+        if is_windows():
+            # psmux exposes these as session options and does not fully emulate tmux's wheel bindings.
+            run_mux(["set-option", "-t", session_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
+            run_mux(["set-option", "-t", session_target, "mode-keys", "vi"], check=False)
+            return
+
         run_mux(["set-window-option", "-t", window_target, "history-limit", str(TMUX_HISTORY_LIMIT)], check=False)
         run_mux(["set-window-option", "-t", window_target, "mode-keys", "vi"], check=False)
 
@@ -874,6 +960,50 @@ class CodexSession:
             return None
         return completed.stdout
 
+    def _pane_in_mode(self) -> bool:
+        completed = run_mux(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                self._mux_target,
+                "#{pane_in_mode}",
+            ],
+            check=False,
+        )
+        return completed.returncode == 0 and completed.stdout.strip() == "1"
+
+    def _session_looks_like_codex(self) -> bool:
+        snapshot = self._capture_snapshot()
+        if snapshot is None:
+            return False
+
+        if any(
+            marker in snapshot
+            for marker in (
+                "To get started, describe a task",
+                "Write tests for @filename",
+                "OpenAI Codex",
+                "tab to queue message",
+                "context left",
+                "Starting MCP servers",
+                "Do you trust the contents of this directory?",
+                "Continue anyway? [y/N]:",
+            )
+        ):
+            return True
+
+        shell_banner_markers = (
+            "Microsoft Windows [",
+            "(c) Microsoft Corporation",
+            "PowerShell",
+            "PS ",
+        )
+        if any(marker in snapshot for marker in shell_banner_markers) or SHELL_PROMPT_RE.search(snapshot):
+            return False
+
+        return self._ui_ready.is_set()
+
     def _send_keys(self, *keys: str) -> None:
         run_mux(["send-keys", "-t", self._mux_target, *keys])
 
@@ -925,6 +1055,11 @@ class CodexSession:
 
         if not self._ui_ready.is_set():
             self._ui_ready.wait(timeout=SESSION_STARTUP_TIMEOUT_SECONDS)
+
+        if self._pane_in_mode():
+            self._logger.warning("Codex pane is in copy-mode; exiting before submitting %s", prompt_name)
+            self._send_keys("q")
+            time.sleep(0.15)
 
         self._logger.info("Submitting prompt to Codex (%s)", prompt_name)
         self._paste_text(prompt)
@@ -1480,6 +1615,8 @@ def check_environment(config: BridgeConfig) -> list[str]:
             problems.append("psmux is not available in PATH. Install it with: winget install psmux")
         else:
             problems.append("tmux is not available in PATH")
+    elif is_windows() and resolve_power_shell_executable() is None:
+        problems.append("PowerShell is not available in PATH, but Windows psmux startup depends on it")
 
     wrapper_path = Path(__file__).parent / lark_cli_wrapper_relative_path()
     if not wrapper_path.exists():

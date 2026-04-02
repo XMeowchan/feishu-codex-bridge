@@ -42,6 +42,10 @@ def has_flag(args: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(prefix) for arg in args)
 
 
+def is_option_token(arg: str) -> bool:
+    return arg.startswith("-")
+
+
 def normalize_legacy_im_args(args: list[str]) -> list[str]:
     if len(args) < 3:
         return args
@@ -50,33 +54,45 @@ def normalize_legacy_im_args(args: list[str]) -> list[str]:
     rest = args[2:]
 
     if head == ("im", "+messages-reply") and not has_flag(rest, "--message-id"):
-        if len(rest) >= 1:
-            message_id = rest[0]
-            text = rest[1] if len(rest) >= 2 else ""
-            identity = rest[2] if len(rest) >= 3 else ""
-            normalized = ["im", "+messages-reply", "--message-id", message_id]
-            if text:
-                normalized.extend(["--text", text])
-            if identity:
-                normalized.extend(["--as", identity])
+        if rest and not is_option_token(rest[0]):
+            if len(rest) >= 2 and is_option_token(rest[1]):
+                return args
+
+            normalized = ["im", "+messages-reply", "--message-id", rest[0]]
+            consumed = 1
+
+            if len(rest) >= 2:
+                normalized.extend(["--text", rest[1]])
+                consumed = 2
+
+            if consumed == 2 and len(rest) >= 3 and not is_option_token(rest[2]):
+                normalized.extend(["--as", rest[2]])
+                consumed = 3
+
+            normalized.extend(rest[consumed:])
             return normalized
 
     if head == ("im", "+messages-send") and not (
         has_flag(rest, "--chat-id") or has_flag(rest, "--user-id")
     ):
-        if len(rest) >= 1:
-            target = rest[0]
-            text = rest[1] if len(rest) >= 2 else ""
-            identity = rest[2] if len(rest) >= 3 else ""
+        if rest and not is_option_token(rest[0]):
             normalized = ["im", "+messages-send"]
-            if target.startswith("ou_"):
-                normalized.extend(["--user-id", target])
+            if rest[0].startswith("ou_"):
+                normalized.extend(["--user-id", rest[0]])
             else:
-                normalized.extend(["--chat-id", target])
-            if text:
-                normalized.extend(["--text", text])
-            if identity:
-                normalized.extend(["--as", identity])
+                normalized.extend(["--chat-id", rest[0]])
+
+            consumed = 1
+
+            if len(rest) >= 2 and not is_option_token(rest[1]):
+                normalized.extend(["--text", rest[1]])
+                consumed = 2
+
+            if consumed == 2 and len(rest) >= 3 and not is_option_token(rest[2]):
+                normalized.extend(["--as", rest[2]])
+                consumed = 3
+
+            normalized.extend(rest[consumed:])
             return normalized
 
     return args
